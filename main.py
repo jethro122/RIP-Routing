@@ -1,58 +1,22 @@
-def routing_table(filenm):
-    ''' Reads the config from the config file and builds the routing table
-        from it.
-        @param filename: name of the config file to read '''
-    global own_id
-    total = []
-    table = {}
-    c1=open(filenm, 'r')
-    for i in c1.readlines():
-        i=i.split(', ')
-        total.append(i)
+'''
+Cosc 364 assignment 1 rip router
+By Jacob Early and Jethro Jones Long
+'''
 
-    own_id = int(total[0][1])
-    inputs_length = len(total[1])
-    outputs_length = len(total[2])
+import struct
+import socket
+import select
+import random
+import sys
+import time
+# setup fuctions =====================================================================================
 
 
-    for i in range(1, inputs_length):
-        input_ports.append(int(total[1][i]))
-
-
-    for i in range(1,outputs_length):
-        temp = total[2][i]
-        temp = temp.split('-')
-        router_id = int(temp[2])
-        portno = int(temp[0])
-        output_ports[portno] = router_id
-        first_router = router_id
-        metric = int(temp[1])
-        flag = False
-        timers = [0, 0]
-
-        # Layout of this table is [ID: [FIRST-ROUTER,COST,FLAG,TIMER]]
-        table[router_id] = [first_router, metric, flag, timers]
-    #     print("Output Ports: " + str(output_ports))
-    #     print_table(table)
-    #     print("----- Finished reading configuration file.\n")
-    return table
-
-
-
-
-def listenlist():
-    '''Creates and binds input_ports to sockets'''
-
-    sock_list=[]
-    for i in range(0, len(input_ports)):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(('', int(input_ports[i]) ))
-        sock_list.append(sock)
-    return sock_list
-
-'''Jacobs new fuctions, needs error checks still'''
 def readconfigfile(configfilename):
-    '''Takes a config file and returns the routerid list of input ports and list of outputs'''
+    '''Takes a config file name and returns router id, input ports and outputs from it
+    Router id: is an int between 1 and 64000
+    input ports: is a list of ports between 1024 and 64000 with no duplicates to listen on
+    outputs: is a list of [outputport, metric, outputid] for each output from this router'''
 
     configlist = []
     configfile = open(configfilename, 'r')
@@ -101,42 +65,38 @@ def readconfigfile(configfilename):
         outputs.append([outputport, metric, outputid])
         outputports.append(outputport)
 
-    #print(routerid)
-    #print(inputports)
-    #print(outputs)
-
     return(routerid, inputports, outputs)
 
 
 def createroutingtable(outputs):
+    '''takes a list of outputs from reading the config file and creates a routing table for this router
+    the routing table is a dictionary of router ids : [firsthop, metric, flag, timers]'''
     table = {}
-    flag = False
+    flag = 0
     timers = [0, 0]
 
     for output in outputs:
         routerid = output[2]
-        firstrouter = routerid
-        distance = output[1]
-        table[routerid] = [firstrouter, distance, flag, timers]
+        firsthop = routerid
+        metric = output[1]
+        table[routerid] = [firsthop, metric, flag, timers]
 
     return(table)
 
 
 def outputportdict(outputs):
+    '''creates a dictionary of output ports : router ids'''
     outputports = {}
     for output in outputs:
         outputports[output[0]] = output[2]
 
     return(outputports)
 
-# =============================================================
-# receiver: Needs more editing with message changes
-# listens on all input sockets for a message and then processes that message. can be split into reciving and processing
-def create_message(table, routerid):
-    ''' Creates message with information about
-        @param t: dictionary representing the routing table
-        @param port: port number that it is being sent to so that we can
-                     exclude entries.
+# Socket fuctions ===========================================================================================
+
+
+def create_message(table, routerid, outputs, port, triggered=0):
+    ''' Creates a response message with correct header and body in bytes
     '''
     headerformat = '!BBH'
     ripentryformat = '!HHIIII'
@@ -144,33 +104,60 @@ def create_message(table, routerid):
     version = 2  # rip version
     header = struct.pack(headerformat, command, version, routerid)
 
-    for i in table:
-        value = table[i]
+    for routerid in table:
+        value = table[routerid]
         metric = value[1]
         afi = 0
-        ripentry = struct.pack(ripentryformat, afi, 0, i, 0, 0, metric)
+        if triggered == 1 and value[2] == 0:
+            continue  # Skips if part of a triggered update and not flagged
+        if outputs[port] == routerid:
+            metric = 16  # poision reverse
+        ripentry = struct.pack(ripentryformat, afi, 0, routerid, 0, 0, metric)
         header += ripentry
 
-    return header
+    return(header)
 
-def receiver(table, timeout):
-    ''' Checks the sockets to see if any messages have been received.
-        @param rt_table: dictionary representing the routing table
+
+def listen(inputports):
+    ''' listens on all input sockets for data and returns the data packets
     '''
+    data = 0
+    socketlist = []
+    for i in range(0, len(inputports)):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(('', int(inputports[i])))
+        socketlist.append(sock)
 
-    socket_list = listenlist()  # binds and listens to inputsockets
-    table_key = []
-    sockets, b, c = select.select(socket_list, [], [], timeout)
+    sockets, b ,c = select.select(socketlist, [], [], 2)
     if sockets != []:
         s = sockets[0]
         s.settimeout(10)
         data, addr = s.recvfrom(1024)
 
-
     return(data)
 
 
+def send_message(table, routerid, outputs, triggered=0):
+    '''Sends update message'''
+    udp_ip = "127.0.0.1"
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    for port in outputs:
+        update = create_message(table, routerid, outputs, port, triggered)
+        server_socket.sendto(update, (udp_ip, port))
+    printtable(table, routerid)
+    if triggered == 1:
+        for key in table:
+            table[key][2] = 0
+
+    delay = random.randint(1, 5)
+    return(delay)
+
+# processing data ======================================================================
+
+
 def processmsg(data):
+    '''Takes a received rip packet and unpacks the bytes into a more usable table
+    returns a list in the form[header, [router id, metric]]'''
     headerformat = '!BBH'
     ripentryformat = '!HHIIII'
 
@@ -199,61 +186,147 @@ def processmsg(data):
 
 
 def processrecvtable(data, table):
+    '''Takes a recived table and adds it to this routers routing table'''
     # processes recived table : needs updating for new table format
     # validates and adds into this routers table
     # Will need to change when message is changed
-
+    sourcerouter = data[0][2]
     # reset timers for direct neighbour
-    table[src][-1][0] = 0
-    table[src][-1][1] = 0
-    table[src][2] = False
 
-    start = 3  # start of table in message
-    src = int(data[2])  # data sorce
-    while start < len(data):
-        rec_id = int(data[start])
-        router_id = int(data[start])
+    # checks for validity
 
-        # validates metric
-        if metric not in range(0, 17):  # fix
-            print("Packet does not conform. Metric not in range 0-16")
-            break
+    table[sourcerouter][-1][0] = 0
+    table[sourcerouter][-1][1] = 0
+
+    for i in data[1:]:
+        routerid = i[0]
+        metric = i[1]
+
+        # metric validation
+        if metric < 1 or metric > 16:
+            print("Metric not in range 0-16")
+            continue  # skip this entry
 
         # update metric
-        metric = min(int(data[start + 1]) + table[src][1], 16)
+        metric = min(i[1] + table[sourcerouter][1], 16)
 
-        # validates id and adds to table
-        if router_id not in output_ports.values() and router_id != own_id:
-            if not id_in_list(rec_id, table):
-                table[router_id] = [src, metric, False, [0, 0]]
+        if routerid in table:  # check if update metric
+            if table[routerid][0] == sourcerouter:
+                table[routerid][-1] = [0, 0]
+                table[routerid][1] = metric
+                # trigger update if metric different
+                if metric == 16:
+                    deleteentry(table, routerid)
 
-            if (metric < table[router_id][1]):
-                # better route has been found
-                table[router_id][1] = metric
-                table[router_id][0] = src
+            elif metric < table[routerid][1]:
+                table[routerid] = [sourcerouter, metric, 1, [0, 0]]
+                # trigger update
 
-            if (src == table[router_id][0]):
-                # Submitting to the information the router gives us if they
-                # are the first hop to the destination.
-                table[router_id][1] = metric
-                table[router_id][0] = src
-                table[router_id][-1][0] = 0  # Reset Timer
-                table[router_id][-1][1] = 0
-                table[router_id][2] = False
-
-        start += 2
+        elif metric < 16:  # add router to table if less than inf
+            table[routerid] = [sourcerouter, metric, 1, [0, 0]]
+            # trigger update
 
     return(table)
 
 
-def router_keys(table):
-    ''' returns keys grabbed from the route table
-    '''
-    route_keys=[]
-    try:
-        for y in table.keys():
-            route_keys.append(y)
-        return route_keys
-    except:
-        return route_keys
+def deleteentry(table, key):
+    '''updates a given key to be marked for deletion'''
+    table[key][1] = 16
+    table[key][2] = 1
+    table[key][3][1] = 120
 
+    return(key)
+
+
+def garbagecollection(timetaken, table):
+    '''if garbage time greater than 0 decrease by time taken and if this reduces it to 0 or below delete
+    entry from table'''
+    for key in table:
+        garbage_timer = table[key][-1][1]
+
+        if garbage_timer > 0:
+            garbage_timer -= timetaken
+            if garbage_timer <= 0:
+                del table[key]
+
+
+def timeout(timetaken, table):
+    '''increment the timeout counters and if it goes above 30 mark for deletion'''
+    for key in table:
+        route_timer = table[key][-1][0]
+
+        if route_timer < 30:  # Timeout amount
+            route_timer += timetaken
+
+        if route_timer >= 30:
+            deleteentry(table, key)
+
+
+# Printer ====================================================
+
+def printtable(table, routerid):
+    new_line = (
+        "---+++-------+++--------+++------+++-------------+++--------------")
+    print("|                    ROUTING TABLE FOR ROUTER {}                    |"
+          .format(routerid))
+    print(new_line)
+    print("ID ||| F_HOP ||| METRIC ||| FLAG ||| GARBTIMEOUT ||| ROUTETIMEOUT ")
+
+    for entry in table:
+        print("{}  |||  {}    |||   {}    |||  {}  |||     {}      |||       {}     "
+              .format(entry, table[entry][0], table[entry][1], table[entry][2], table[entry][3][0], table[entry][3][1]))
+        print(new_line)
+    
+
+
+# Main =======================================================
+
+
+def main(configfile):
+    '''main loop'''
+
+    # setup
+    routerid, inputs, outputs = readconfigfile(configfile)
+    routingtable = createroutingtable(outputs)
+    outputports = outputportdict(outputs)
+    start = time.time()
+
+    loop_count = 0
+    delay = random.randint(1, 5)
+
+    while True:
+        loop_count += 1
+        send_message(routingtable, routerid, outputports)
+        start = time.time()
+        elapsedtime = time.time() - start
+        broadcasttime = 5  # Update trigger
+        offset = random.randint(-5, 5)
+        broadcasttime += offset
+
+        while elapsedtime < broadcasttime:
+            start2 = time.time()
+            datarecv = listen(inputs)
+            if datarecv != 0:
+                datarecv = processmsg(datarecv)
+                processrecvtable(datarecv, routingtable)
+            timetaken = time.time() - start2
+            delay = delay - timetaken
+            if delay < 0:
+                delay = send_message(routingtable, routerid, outputports, 1)
+            timetaken = time.time() - start2
+            garbagecollection(timetaken, routingtable)
+            timeout(timetaken, routingtable)
+            elapsedtime += timetaken
+
+        printtable(routingtable, routerid)
+    return(None)
+
+
+# Driver ======================================================
+if __name__ == "__main__":
+    if len(sys.argv) == 2:
+        configfile = sys.argv[1]
+        main(configfile)
+    else:
+        print('This router needs a config file')
+        exit()
